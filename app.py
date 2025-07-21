@@ -17,12 +17,18 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 st.set_page_config(page_title="Video Search (YOLO + CLIP)", layout="wide")
 st.title("🎥🔎 Video Search with YOLOv8 + CLIP")
 
+# Use a session-local frames directory in temp
+FRAMES_DIR = os.path.join(tempfile.gettempdir(), "frames")
+os.makedirs(FRAMES_DIR, exist_ok=True)
+
 # =======================
 # LOAD MODELS
 # =======================
 @st.cache_resource
 def load_yolo():
+    # lightweight YOLO model for cloud
     return YOLO("yolov8n.pt")
+
 yolo_model = load_yolo()
 
 @st.cache_resource
@@ -30,29 +36,33 @@ def load_clip():
     model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
     tokenizer = open_clip.get_tokenizer("ViT-B-32")
     return model.to(device).eval(), preprocess, tokenizer
+
 clip_model, clip_preprocess, tokenizer = load_clip()
 
 # =======================
-# CACHED METADATA
+# SAVE METADATA & INDEX
 # =======================
 @st.cache_data
 def save_metadata(frames, objects, embeddings):
-    os.makedirs("frames", exist_ok=True)
-    with open("metadata.txt", "w") as f:
+    # store metadata in temp directory
+    meta_dir = tempfile.gettempdir()
+    with open(os.path.join(meta_dir, "metadata.txt"), "w") as f:
         for fname in frames:
             f.write(f"{fname}\n")
-    with open("objects.json", "w") as f:
+    with open(os.path.join(meta_dir, "objects.json"), "w") as f:
         json.dump(objects, f, indent=2)
 
     dim = embeddings[0].shape[1]
     index = faiss.IndexFlatIP(dim)
     index.add(np.vstack(embeddings))
-    faiss.write_index(index, "video_index.faiss")
+    faiss.write_index(index, os.path.join(meta_dir, "video_index.faiss"))
 
 # =======================
 # HELPERS
 # =======================
 def extract_frames(video_path, every_n=30):
+    """Extract frames to FRAMES_DIR"""
+    os.makedirs(FRAMES_DIR, exist_ok=True)
     cap = cv2.VideoCapture(video_path)
     count, saved = 0, []
     while True:
@@ -61,7 +71,7 @@ def extract_frames(video_path, every_n=30):
             break
         if count % every_n == 0:
             fname = f"{os.path.basename(video_path)}_{count}.jpg"
-            fpath = os.path.join("frames", fname)
+            fpath = os.path.join(FRAMES_DIR, fname)
             cv2.imwrite(fpath, frame)
             saved.append(fname)
         count += 1
@@ -86,7 +96,9 @@ def encode_image(img_path):
 # =======================
 # VIDEO UPLOAD & PROCESS
 # =======================
-uploaded_videos = st.file_uploader("Upload video(s)", type=["mp4", "avi", "mov"], accept_multiple_files=True)
+uploaded_videos = st.file_uploader(
+    "Upload video(s)", type=["mp4", "avi", "mov"], accept_multiple_files=True
+)
 
 if uploaded_videos:
     with st.spinner("⏳ Processing uploaded videos..."):
@@ -102,7 +114,7 @@ if uploaded_videos:
             all_frames.extend(frames)
 
             for frame in frames:
-                fpath = os.path.join("frames", frame)
+                fpath = os.path.join(FRAMES_DIR, frame)
                 objs = detect_objects(fpath)
                 emb = encode_image(fpath)
                 all_objects[frame] = objs
@@ -120,12 +132,17 @@ if uploaded_videos:
 st.markdown("---")
 st.header("🔎 Search in processed frames")
 
-if os.path.exists("video_index.faiss"):
+meta_dir = tempfile.gettempdir()
+index_path = os.path.join(meta_dir, "video_index.faiss")
+meta_txt_path = os.path.join(meta_dir, "metadata.txt")
+objects_json_path = os.path.join(meta_dir, "objects.json")
+
+if os.path.exists(index_path):
     query = st.text_input("Enter a text description to search:")
     if query:
-        index = faiss.read_index("video_index.faiss")
-        metadata = [line.strip() for line in open("metadata.txt")]
-        objects_map = json.load(open("objects.json"))
+        index = faiss.read_index(index_path)
+        metadata = [line.strip() for line in open(meta_txt_path)]
+        objects_map = json.load(open(objects_json_path))
 
         tok = tokenizer([query])
         with torch.no_grad():
@@ -137,13 +154,13 @@ if os.path.exists("video_index.faiss"):
 
         for idx, score in zip(I[0], D[0]):
             fname = metadata[idx]
-            img_path = os.path.join("frames", fname)
+            img_path = os.path.join(FRAMES_DIR, fname)
             if os.path.exists(img_path):
                 st.image(img_path, caption=f"{fname} (score {score:.3f})", use_container_width=True)
+                st.write("Detected objects:")
+                for obj in objects_map.get(fname, []):
+                    st.write(f"- **{obj['label']}** ({obj['conf']:.2f})")
             else:
                 st.write(f"❌ Image not found: {fname}")
-            st.write("Detected objects:")
-            for obj in objects_map.get(fname, []):
-                st.write(f"- **{obj['label']}** ({obj['conf']:.2f})")
 else:
     st.warning("⚠️ Upload and process videos before searching.")

@@ -1,15 +1,15 @@
 import streamlit as st
-import tempfile
 import os
+import tempfile
 import json
-import faiss
 import torch
 import numpy as np
 from PIL import Image
-from ultralytics import YOLO
-import open_clip
 from collections import Counter
-import imageio.v3 as iio  # ✅ use imageio for frame extraction
+import faiss
+import open_clip
+from ultralytics import YOLO
+import shutil
 
 # =======================
 # SETTINGS
@@ -17,8 +17,10 @@ import imageio.v3 as iio  # ✅ use imageio for frame extraction
 FRAMES_FOLDER = "frames"
 os.makedirs(FRAMES_FOLDER, exist_ok=True)
 device = "cuda" if torch.cuda.is_available() else "cpu"
-st.set_page_config(page_title="Video Search", layout="wide")
-st.title("🎥🔎 Video Search with YOLOv8 + CLIP")
+MIN_SCORE_THRESHOLD = 0.25  # 👈 minimum similarity score to consider a valid match
+
+st.set_page_config(page_title="📷 Image Search with YOLO + CLIP", layout="wide")
+st.title("📷🔎 Image Search with YOLOv8 + CLIP")
 
 # =======================
 # LOAD MODELS
@@ -29,36 +31,17 @@ yolo_model = st.session_state.yolo_model
 
 @st.cache_resource
 def load_clip():
-    m, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        "ViT-B-32", pretrained="openai"
+    )
     tokenizer = open_clip.get_tokenizer("ViT-B-32")
-    return m.to(device).eval(), preprocess, tokenizer
+    return model.to(device).eval(), preprocess, tokenizer
 
 clip_model, clip_preprocess, tokenizer = load_clip()
 
 # =======================
-# FRAME EXTRACTION (with imageio)
+# FUNCTIONS
 # =======================
-def extract_frames(video_path, every_n=30):
-    saved = []
-    try:
-        # iterate over frames using imageio
-        reader = iio.imiter(video_path)
-        for idx, frame in enumerate(reader):
-            if idx % every_n == 0:
-                img = Image.fromarray(frame)  # frame is already RGB
-                # Optionally resize for speed
-                if img.width > 640:
-                    scale = 640 / img.width
-                    img = img.resize((640, int(img.height * scale)))
-                fname = f"{os.path.basename(video_path)}_{idx}.jpg"
-                fpath = os.path.join(FRAMES_FOLDER, fname)
-                img.save(fpath, format="JPEG")
-                saved.append(fname)
-        return saved
-    except Exception as e:
-        st.error(f"❌ Frame extraction failed: {e}")
-        return []
-
 def detect_objects(img_path):
     results = yolo_model(img_path, conf=0.3, verbose=False)
     objs = []
@@ -78,59 +61,56 @@ def encode_image(img_path):
     return feat.cpu().numpy()
 
 # =======================
-# VIDEO UPLOAD
+# IMAGE UPLOAD & PROCESS
 # =======================
-uploaded_videos = st.file_uploader("📤 Upload video(s)", type=["mp4", "avi", "mov"], accept_multiple_files=True)
+uploaded_images = st.file_uploader(
+    "Upload one or more images",
+    type=["jpg", "jpeg", "png"],
+    accept_multiple_files=True
+)
 
-if uploaded_videos:
-    st.info("⏳ Processing uploaded videos...")
-    all_frames = []
+if uploaded_images:
+    all_filenames = []
     all_objects = {}
     all_embeddings = []
 
-    for video in uploaded_videos:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(video.name)[1]) as tmp:
-            tmp.write(video.read())
+    for image_file in uploaded_images:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(image_file.name)[1]) as tmp:
+            tmp.write(image_file.read())
             tmp_path = tmp.name
 
-        st.write(f"📥 Extracting frames from **{video.name}**...")
-        frames = extract_frames(tmp_path, every_n=10)  # grab every 10th frame for more data
-        all_frames.extend(frames)
+        fname = os.path.basename(tmp_path)
+        dst_path = os.path.join(FRAMES_FOLDER, fname)
+        shutil.move(tmp_path, dst_path)
+        all_filenames.append(fname)
 
-        for frame in frames:
-            fpath = os.path.join(FRAMES_FOLDER, frame)
-            objs = detect_objects(fpath)
-            emb = encode_image(fpath)
-            all_objects[frame] = objs
-            all_embeddings.append(emb)
+        objs = detect_objects(dst_path)
+        all_objects[fname] = objs
+        emb = encode_image(dst_path)
+        all_embeddings.append(emb)
 
-    # Save metadata
     with open("metadata.txt", "w") as f:
-        for m in all_frames:
+        for m in all_filenames:
             f.write(f"{m}\n")
     with open("objects.json", "w") as f:
         json.dump(all_objects, f, indent=2)
 
-    # Build FAISS
     if all_embeddings:
         dim = all_embeddings[0].shape[1]
         index = faiss.IndexFlatIP(dim)
         index.add(np.vstack(all_embeddings))
-        faiss.write_index(index, "video_index.faiss")
-        st.success("✅ Processing complete! You can now search.")
+        faiss.write_index(index, "image_index.faiss")
+        st.success("✅ Images processed successfully! You can now search.")
     else:
-        st.error("⚠️ No valid frames found! Try another video.")
+        st.error("⚠️ No embeddings created.")
 
-# =======================
-# SEARCH SECTION
-# =======================
 st.markdown("---")
-st.header("🔎 Search in processed frames")
+st.header("🔎 Search Images")
 
-if os.path.exists("video_index.faiss") and os.path.exists("metadata.txt") and os.path.exists("objects.json"):
-    query = st.text_input("Enter text to search:")
+if os.path.exists("image_index.faiss") and os.path.exists("metadata.txt"):
+    query = st.text_input("Enter a description (e.g. 'car', 'dog'):")
     if query:
-        index = faiss.read_index("video_index.faiss")
+        index = faiss.read_index("image_index.faiss")
         metadata = [line.strip() for line in open("metadata.txt")]
         objects_map = json.load(open("objects.json"))
 
@@ -141,28 +121,36 @@ if os.path.exists("video_index.faiss") and os.path.exists("metadata.txt") and os
 
         D, I = index.search(tfeat.cpu().numpy(), k=5)
 
-        st.subheader(f"Top matches for **'{query}'**:")
-        for idx, score in zip(I[0], D[0]):
-            fname = metadata[idx]
-            img_path = os.path.join(FRAMES_FOLDER, fname)
-            if os.path.exists(img_path):
-                st.image(img_path, caption=f"{fname} (score {score:.3f})", use_container_width=True)
-            else:
-                st.write(f"❌ Missing file: {img_path}")
-            st.write("Objects detected:")
-            for obj in objects_map.get(fname, []):
-                st.write(f"- **{obj['label']}** ({obj['conf']:.2f})")
+        # filter results by threshold
+        valid_results = [(idx, score) for idx, score in zip(I[0], D[0]) if score >= MIN_SCORE_THRESHOLD]
+
+        if not valid_results:
+            st.warning("⚠️ No results found for your query.")
+        else:
+            st.subheader(f"Top matches for **'{query}'**:")
+            for idx, score in valid_results:
+                fname = metadata[idx]
+                img_path = os.path.join(FRAMES_FOLDER, fname)
+                if os.path.exists(img_path):
+                    st.image(img_path, caption=f"{fname} (score {score:.3f})", width=400)
+                else:
+                    st.write(f"❌ Image not found: {img_path}")
+
+                st.write("Objects detected:")
+                for obj in objects_map.get(fname, []):
+                    st.write(f"- **{obj['label']}** ({obj['conf']:.2f})")
 
     st.markdown("---")
-    st.header("📋 Summarize video")
-    if st.button("Summarize objects"):
+    st.header("📋 Summarize All Uploaded Images")
+    if st.button("Summarize Objects"):
         objects_map = json.load(open("objects.json"))
         all_labels = [obj["label"] for objs in objects_map.values() for obj in objs]
         if not all_labels:
-            st.warning("No objects detected.")
+            st.warning("No objects detected yet.")
         else:
             counts = Counter(all_labels)
+            st.write("✅ **Summary of objects detected:**")
             for label, count in counts.most_common():
-                st.write(f"- **{label}** appears in {count} frames")
+                st.write(f"- **{label}** appears in {count} image(s)")
 else:
-    st.warning("⚠️ Upload and process videos first.")
+    st.info("Upload and process images first.")

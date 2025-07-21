@@ -25,12 +25,13 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 def load_yolo():
     return YOLO("yolov8n.pt")
 
+yolo_model = load_yolo()
+
 @st.cache_resource
 def load_clip():
     m, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
     return m.to(device).eval(), preprocess, open_clip.get_tokenizer("ViT-B-32")
 
-yolo_model = load_yolo()
 clip_model, clip_preprocess, tokenizer = load_clip()
 
 # =======================

@@ -18,26 +18,32 @@ FRAMES_FOLDER = "frames"
 os.makedirs(FRAMES_FOLDER, exist_ok=True)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+st.set_page_config(page_title="Image/Video Intelligence", layout="wide")
+st.title("🎥🔎 Video Intelligence with YOLOv8 + CLIP")
+
 # =======================
-# Load models
+# LOAD MODELS
 # =======================
-# 🚀 IMPORTANT FIX: do NOT cache YOLO (causes pickle errors on Streamlit Cloud)
+# YOLO cannot be cached because of pickle issues on Streamlit Cloud
 if "yolo_model" not in st.session_state:
     st.session_state.yolo_model = YOLO("yolov8n.pt")
 yolo_model = st.session_state.yolo_model
 
-# ✅ CLIP model can safely be cached
+# CLIP model can be cached
 @st.cache_resource
 def load_clip():
-    m, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
+    m, _, preprocess = open_clip.create_model_and_transforms(
+        "ViT-B-32", pretrained="openai"
+    )
     return m.to(device).eval(), preprocess, open_clip.get_tokenizer("ViT-B-32")
 
 clip_model, clip_preprocess, tokenizer = load_clip()
 
 # =======================
-# Helper functions
+# HELPERS
 # =======================
 def extract_frames(video_path, every_n=30):
+    """Extract frames from video using PIL to save (to avoid blank issues)."""
     cap = cv2.VideoCapture(video_path)
     count = 0
     saved = []
@@ -46,9 +52,19 @@ def extract_frames(video_path, every_n=30):
         if not ret:
             break
         if count % every_n == 0:
+            # resize to width <= 640 for lighter processing
+            h, w, _ = frame.shape
+            if w > 640:
+                scale = 640 / w
+                frame = cv2.resize(frame, (640, int(h * scale)))
+
+            # convert BGR to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img_pil = Image.fromarray(frame_rgb)
+
             fname = f"{os.path.basename(video_path)}_{count}.jpg"
             fpath = os.path.join(FRAMES_FOLDER, fname)
-            cv2.imwrite(fpath, frame)
+            img_pil.save(fpath, format="JPEG")
             saved.append(fname)
         count += 1
     cap.release()
@@ -73,13 +89,13 @@ def encode_image(img_path):
     return feat.cpu().numpy()
 
 # =======================
-# Streamlit UI
+# VIDEO UPLOAD & PROCESSING
 # =======================
-st.set_page_config(page_title="Video Intelligence", layout="wide")
-st.title("🎥🔎 Video Intelligence with YOLOv8 + CLIP")
-
-# ============ Video Upload & Processing ============
-uploaded_videos = st.file_uploader("Upload video files", type=["mp4", "avi", "mov"], accept_multiple_files=True)
+uploaded_videos = st.file_uploader(
+    "Upload video files",
+    type=["mp4", "avi", "mov"],
+    accept_multiple_files=True
+)
 
 if uploaded_videos:
     st.info("⏳ Processing uploaded videos...")
@@ -116,13 +132,16 @@ if uploaded_videos:
         index = faiss.IndexFlatIP(dim)
         index.add(np.vstack(all_embeddings))
         faiss.write_index(index, "video_index.faiss")
-        st.success("✅ Processing complete! You can now search for objects or summarize the video.")
+        st.success("✅ Processing complete! You can now search for objects.")
     else:
         st.error("⚠️ No frames processed!")
 
 st.markdown("---")
 st.header("🔎 Search in processed videos")
 
+# =======================
+# SEARCH
+# =======================
 if os.path.exists("video_index.faiss") and os.path.exists("metadata.txt") and os.path.exists("objects.json"):
     query = st.text_input("Enter a text description to search:")
     if query:
@@ -142,14 +161,13 @@ if os.path.exists("video_index.faiss") and os.path.exists("metadata.txt") and os
             fname = metadata[idx]
             img_path = os.path.join(FRAMES_FOLDER, fname)
             if os.path.exists(img_path):
-                st.image(img_path, caption=f"{fname} (score {score:.3f})", use_column_width=True)
+                st.image(img_path, caption=f"{fname} (score {score:.3f})", width=400)  # 👈 fixed size
             else:
                 st.write(f"❌ Image file not found: {img_path}")
             st.write("Objects detected in this frame:")
             for obj in objects_map.get(fname, []):
                 st.write(f"- **{obj['label']}** ({obj['conf']:.2f})")
 
-    # ============ Summarize Video ============
     st.markdown("---")
     st.header("📋 Summarize Video Content")
     if st.button("Summarize All Objects"):

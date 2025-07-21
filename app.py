@@ -1,92 +1,157 @@
 import streamlit as st
-from PIL import Image
-import torch
-from ultralytics import YOLO
-import numpy as np
+import tempfile
 import os
+import cv2
+import json
+import faiss
+import torch
+import numpy as np
+from PIL import Image
+from ultralytics import YOLO
+import open_clip
 
-# -----------------------
-# Title & Description
-# -----------------------
-st.set_page_config(page_title="Video/Image Recognition", layout="wide")
-st.title("🎥 Video & 🖼️ Image Recognition App")
-st.markdown("Upload an image or video, run detection with YOLOv8, and view the results!")
+# =======================
+# SETTINGS
+# =======================
+FRAMES_FOLDER = "frames"
+os.makedirs(FRAMES_FOLDER, exist_ok=True)
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# -----------------------
-# Load YOLO model
-# -----------------------
+st.set_page_config(page_title="Video Search (YOLO + CLIP)", layout="wide")
+st.title("🎥🔎 Video Search with YOLOv8 + CLIP")
+
+# =======================
+# LOAD MODELS
+# =======================
 @st.cache_resource
-def load_model():
-    # Latest ultralytics with pytorch 2.7.1
-    model = YOLO("yolov8n.pt")  # or yolov8s.pt depending on accuracy/speed tradeoff
-    return model
+def load_yolo():
+    # smallest YOLOv8n model
+    return YOLO("yolov8n.pt")
+yolo_model = load_yolo()
 
-model = load_model()
-st.success(f"✅ YOLOv8 model loaded (PyTorch {torch.__version__})")
+@st.cache_resource
+def load_clip():
+    model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
+    tokenizer = open_clip.get_tokenizer("ViT-B-32")
+    return model.to(device).eval(), preprocess, tokenizer
+clip_model, clip_preprocess, tokenizer = load_clip()
 
-# -----------------------
-# File Upload
-# -----------------------
-uploaded_file = st.file_uploader("Upload an image or video", type=["jpg", "jpeg", "png", "mp4", "avi", "mov"])
+# =======================
+# HELPERS
+# =======================
+def extract_frames(video_path, every_n=30):
+    """Extract frames every N frames and save to folder."""
+    cap = cv2.VideoCapture(video_path)
+    count = 0
+    saved = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if count % every_n == 0:
+            fname = f"{os.path.basename(video_path)}_{count}.jpg"
+            fpath = os.path.join(FRAMES_FOLDER, fname)
+            cv2.imwrite(fpath, frame)
+            saved.append(fname)
+        count += 1
+    cap.release()
+    return saved
 
-if uploaded_file is not None:
-    # Save to a temporary path
-    temp_dir = "temp_uploads"
-    os.makedirs(temp_dir, exist_ok=True)
-    file_path = os.path.join(temp_dir, uploaded_file.name)
+def detect_objects(img_path):
+    """Detect objects with YOLO and return labels/confidences."""
+    results = yolo_model(img_path, conf=0.3, verbose=False)
+    objs = []
+    for box in results[0].boxes:
+        objs.append({
+            "label": results[0].names[int(box.cls[0])],
+            "conf": float(box.conf[0])
+        })
+    return objs
 
-    with open(file_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    st.info(f"📁 Saved file to {file_path}")
+def encode_image(img_path):
+    """Generate CLIP embedding for an image."""
+    img = Image.open(img_path).convert("RGB")
+    tens = clip_preprocess(img).unsqueeze(0).to(device)
+    with torch.no_grad():
+        feat = clip_model.encode_image(tens)
+        feat /= feat.norm(dim=-1, keepdim=True)
+    return feat.cpu().numpy()
 
-    # -----------------------
-    # Process Image
-    # -----------------------
-    if uploaded_file.type.startswith("image"):
-        # Display original
-        image = Image.open(uploaded_file)
-        st.image(image, caption="Uploaded Image", use_container_width=True)
+# =======================
+# VIDEO UPLOAD & PROCESS
+# =======================
+uploaded_videos = st.file_uploader(
+    "Upload one or more videos",
+    type=["mp4", "avi", "mov"],
+    accept_multiple_files=True
+)
 
-        # Run detection
-        st.write("🔍 Running detection… please wait")
-        results = model(image)
-        # Save the annotated result
-        result_img_path = os.path.join(temp_dir, "result.jpg")
-        annotated_img = results[0].plot()  # numpy array
-        Image.fromarray(annotated_img).save(result_img_path)
+if uploaded_videos:
+    st.info("⏳ Processing uploaded videos...")
+    all_frames = []
+    all_objects = {}
+    all_embeddings = []
 
-        st.image(annotated_img, caption="Detection Result", use_container_width=True)
+    for video in uploaded_videos:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(video.name)[1]) as tmp:
+            tmp.write(video.read())
+            tmp_path = tmp.name
 
-        # Summary of detections
-        names = model.names
-        detected_counts = {}
-        for box in results[0].boxes:
-            cls_id = int(box.cls)
-            cls_name = names.get(cls_id, str(cls_id))
-            detected_counts[cls_name] = detected_counts.get(cls_name, 0) + 1
+        st.write(f"📥 Extracting frames from **{video.name}**...")
+        frames = extract_frames(tmp_path, every_n=30)
+        all_frames.extend(frames)
 
-        st.markdown("### 📋 Detection Summary")
-        if detected_counts:
-            for k, v in detected_counts.items():
-                st.write(f"✅ {k}: {v}")
-        else:
-            st.write("⚠️ No objects detected.")
+        for frame in frames:
+            fpath = os.path.join(FRAMES_FOLDER, frame)
+            objs = detect_objects(fpath)
+            all_objects[frame] = objs
+            emb = encode_image(fpath)
+            all_embeddings.append(emb)
 
-    # -----------------------
-    # Process Video
-    # -----------------------
-    elif uploaded_file.type.startswith("video"):
-        st.video(file_path)
-        st.write("🔍 Running detection on video… this may take a while.")
+    # Save metadata
+    with open("metadata.txt", "w") as f:
+        for m in all_frames:
+            f.write(f"{m}\n")
+    with open("objects.json", "w") as f:
+        json.dump(all_objects, f, indent=2)
 
-        # Run YOLO prediction on video (stream=True allows frame-by-frame processing)
-        output_path = os.path.join(temp_dir, "result_video.mp4")
-        results = model.predict(file_path, save=True, project=temp_dir, name="video_results")
-        # YOLO saves processed video in temp_dir/video_results
-        predicted_video = os.path.join(temp_dir, "video_results", uploaded_file.name)
+    # Build FAISS index
+    if all_embeddings:
+        dim = all_embeddings[0].shape[1]
+        index = faiss.IndexFlatIP(dim)
+        index.add(np.vstack(all_embeddings))
+        faiss.write_index(index, "video_index.faiss")
+        st.success("✅ Processing complete! You can now search for frames.")
+    else:
+        st.error("⚠️ No frames processed!")
 
-        if os.path.exists(predicted_video):
-            st.video(predicted_video)
-            st.success("✅ Detection completed on video!")
-        else:
-            st.error("❌ Processed video not found. Check logs for errors.")
+st.markdown("---")
+st.header("🔎 Search in processed frames")
+
+if os.path.exists("video_index.faiss") and os.path.exists("metadata.txt") and os.path.exists("objects.json"):
+    query = st.text_input("Enter a text description to search:")
+    if query:
+        index = faiss.read_index("video_index.faiss")
+        metadata = [line.strip() for line in open("metadata.txt")]
+        objects_map = json.load(open("objects.json"))
+
+        tok = tokenizer([query])
+        with torch.no_grad():
+            tfeat = clip_model.encode_text(tok.to(device))
+            tfeat /= tfeat.norm(dim=-1, keepdim=True)
+
+        D, I = index.search(tfeat.cpu().numpy(), k=5)
+
+        st.subheader(f"Top matches for **'{query}'**:")
+        for idx, score in zip(I[0], D[0]):
+            fname = metadata[idx]
+            img_path = os.path.join(FRAMES_FOLDER, fname)
+            if os.path.exists(img_path):
+                st.image(img_path, caption=f"{fname} (score {score:.3f})", use_container_width=True)
+            else:
+                st.write(f"❌ Image file not found: {img_path}")
+            st.write("Objects detected in this frame:")
+            for obj in objects_map.get(fname, []):
+                st.write(f"- **{obj['label']}** ({obj['conf']:.2f})")
+else:
+    st.warning("⚠️ Please upload and process videos first.")

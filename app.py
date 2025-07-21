@@ -23,10 +23,8 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 # =======================
 @st.cache_resource
 def load_yolo():
-    # load architecture and pretrained weights
-    m = YOLO("yolov8n.yaml")  # architecture file
-    m.load("yolov8n.pt")      # weights
-    return m
+    # ✅ Load directly from official weights (safe)
+    return YOLO("yolov8n.pt")
 
 yolo_model = load_yolo()
 
@@ -41,7 +39,6 @@ clip_model, clip_preprocess, tokenizer = load_clip()
 # Helper functions
 # =======================
 def extract_frames(video_path, every_n=30):
-    """Extract frames from a video every N frames and save in FRAMES_FOLDER."""
     cap = cv2.VideoCapture(video_path)
     count = 0
     saved = []
@@ -50,7 +47,7 @@ def extract_frames(video_path, every_n=30):
         if not ret:
             break
         if count % every_n == 0:
-            fname = f"{os.path.splitext(os.path.basename(video_path))[0]}_{count}.jpg"
+            fname = f"{os.path.basename(video_path)}_{count}.jpg"
             fpath = os.path.join(FRAMES_FOLDER, fname)
             cv2.imwrite(fpath, frame)
             saved.append(fname)
@@ -59,7 +56,6 @@ def extract_frames(video_path, every_n=30):
     return saved
 
 def detect_objects(img_path):
-    """Run YOLO detection on an image path."""
     results = yolo_model(img_path, conf=0.3, verbose=False)
     objs = []
     for box in results[0].boxes:
@@ -70,7 +66,6 @@ def detect_objects(img_path):
     return objs
 
 def encode_image(img_path):
-    """Encode an image to a CLIP embedding."""
     img = Image.open(img_path).convert("RGB")
     tens = clip_preprocess(img).unsqueeze(0).to(device)
     with torch.no_grad():
@@ -85,11 +80,7 @@ st.set_page_config(page_title="Video Intelligence", layout="wide")
 st.title("🎥🔎 Video Intelligence with YOLO + CLIP")
 
 # ============ Video Upload & Processing ============
-uploaded_videos = st.file_uploader(
-    "Upload video files",
-    type=["mp4", "avi", "mov"],
-    accept_multiple_files=True
-)
+uploaded_videos = st.file_uploader("Upload video files", type=["mp4", "avi", "mov"], accept_multiple_files=True)
 
 if uploaded_videos:
     st.info("⏳ Processing uploaded videos...")
@@ -98,7 +89,7 @@ if uploaded_videos:
     all_embeddings = []
 
     for video in uploaded_videos:
-        # Save uploaded file to a temporary location
+        # Save to a temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(video.name)[1]) as tmp:
             tmp.write(video.read())
             tmp_path = tmp.name
@@ -127,14 +118,13 @@ if uploaded_videos:
         index = faiss.IndexFlatIP(dim)
         index.add(np.vstack(all_embeddings))
         faiss.write_index(index, "video_index.faiss")
-        st.success("✅ Processing complete! You can now search or summarize the video.")
+        st.success("✅ Processing complete! You can now search for objects or summarize the video.")
     else:
         st.error("⚠️ No frames processed!")
 
 st.markdown("---")
 st.header("🔎 Search in processed videos")
 
-# ============ Search & Summarize ============
 if os.path.exists("video_index.faiss") and os.path.exists("metadata.txt") and os.path.exists("objects.json"):
     query = st.text_input("Enter a text description to search:")
     if query:
@@ -161,6 +151,7 @@ if os.path.exists("video_index.faiss") and os.path.exists("metadata.txt") and os
             for obj in objects_map.get(fname, []):
                 st.write(f"- **{obj['label']}** ({obj['conf']:.2f})")
 
+    # ============ Summarize Video ============
     st.markdown("---")
     st.header("📋 Summarize Video Content")
     if st.button("Summarize All Objects"):
@@ -173,7 +164,6 @@ if os.path.exists("video_index.faiss") and os.path.exists("metadata.txt") and os
             st.write("✅ **Summary of objects detected across all frames:**")
             for label, count in counts.most_common():
                 st.write(f"- **{label}** appears in {count} frames")
-
 else:
     st.warning("⚠️ Please upload and process videos first.")
 

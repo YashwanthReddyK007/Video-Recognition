@@ -1,10 +1,9 @@
 streamlit>=1.32.0
+ultralytics>=8.0.120
 torch>=2.1.0
 torchvision>=0.16.0
-ultralytics==8.0.196
-open_clip_torch>=2.24.0
-Pillow>=10.0.0
-opencv-python-headless>=4.9.0.80
+open_clip_torch>=2.20.0
 faiss-cpu>=1.7.4
-tqdm>=4.66.1
-numpy>=1.26.0
+opencv-python-headless>=4.9.0.80
+Pillow>=10.0.0
+numpy>=1.24.0

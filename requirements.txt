@@ -1,7 +1,9 @@
-streamlit==1.37.1
-ultralytics==8.3.10
-torch==2.7.1
-faiss-cpu==1.7.4
-open_clip_torch==2.24.0
-Pillow==10.4.0
-opencv-python-headless==4.10.0.84
+streamlit==1.33.0
+torch==2.2.2
+faiss-cpu==1.7.2
+sentencepiece==0.1.99
+open-clip-torch==2.23.0
+ultralytics==8.2.3
+opencv-python
+numpy
+pillow

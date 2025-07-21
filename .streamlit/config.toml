@@ -1,5 +1,0 @@
-[server]
-maxUploadSize = 500
-headless = true
-port = 8501
-enableCORS = false

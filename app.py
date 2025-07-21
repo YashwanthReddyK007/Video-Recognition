@@ -19,15 +19,14 @@ os.makedirs(FRAMES_FOLDER, exist_ok=True)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # =======================
-# Load models (cached)
+# Load models
 # =======================
-@st.cache_resource
-def load_yolo():
-    # ✅ Load directly from official weights (safe)
-    return YOLO("yolov8n.pt")
+# 🚀 IMPORTANT FIX: do NOT cache YOLO (causes pickle errors on Streamlit Cloud)
+if "yolo_model" not in st.session_state:
+    st.session_state.yolo_model = YOLO("yolov8n.pt")
+yolo_model = st.session_state.yolo_model
 
-yolo_model = load_yolo()
-
+# ✅ CLIP model can safely be cached
 @st.cache_resource
 def load_clip():
     m, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
@@ -77,7 +76,7 @@ def encode_image(img_path):
 # Streamlit UI
 # =======================
 st.set_page_config(page_title="Video Intelligence", layout="wide")
-st.title("🎥🔎 Video Intelligence with YOLO + CLIP")
+st.title("🎥🔎 Video Intelligence with YOLOv8 + CLIP")
 
 # ============ Video Upload & Processing ============
 uploaded_videos = st.file_uploader("Upload video files", type=["mp4", "avi", "mov"], accept_multiple_files=True)
@@ -89,7 +88,6 @@ if uploaded_videos:
     all_embeddings = []
 
     for video in uploaded_videos:
-        # Save to a temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(video.name)[1]) as tmp:
             tmp.write(video.read())
             tmp_path = tmp.name

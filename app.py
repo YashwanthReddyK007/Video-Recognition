@@ -14,22 +14,25 @@ from collections import Counter
 # =======================
 # SETTINGS
 # =======================
-FRAMES_FOLDER = "frames"
+FRAMES_FOLDER = os.path.join(tempfile.gettempdir(), "frames")
 os.makedirs(FRAMES_FOLDER, exist_ok=True)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # =======================
-# Load models
+# Load models (cached)
 # =======================
-# 🚀 IMPORTANT FIX: do NOT cache YOLO (causes pickle errors on Streamlit Cloud)
-if "yolo_model" not in st.session_state:
-    st.session_state.yolo_model = YOLO("yolov8n.pt")
-yolo_model = st.session_state.yolo_model
+@st.cache_resource
+def load_yolo():
+    # ✅ Load directly from official weights
+    return YOLO("yolov8n.pt")
 
-# ✅ CLIP model can safely be cached
+yolo_model = load_yolo()
+
 @st.cache_resource
 def load_clip():
-    m, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
+    m, _, preprocess = open_clip.create_model_and_transforms(
+        "ViT-B-32", pretrained="openai"
+    )
     return m.to(device).eval(), preprocess, open_clip.get_tokenizer("ViT-B-32")
 
 clip_model, clip_preprocess, tokenizer = load_clip()
@@ -55,7 +58,7 @@ def extract_frames(video_path, every_n=30):
     return saved
 
 def detect_objects(img_path):
-    results = yolo_model(img_path, conf=0.3, verbose=False)
+    results = yolo_model(img_path, conf=0.2, verbose=False)  # lowered conf
     objs = []
     for box in results[0].boxes:
         objs.append({
@@ -76,10 +79,12 @@ def encode_image(img_path):
 # Streamlit UI
 # =======================
 st.set_page_config(page_title="Video Intelligence", layout="wide")
-st.title("🎥🔎 Video Intelligence with YOLOv8 + CLIP")
+st.title("🎥🔎 Video Intelligence with YOLO + CLIP")
 
 # ============ Video Upload & Processing ============
-uploaded_videos = st.file_uploader("Upload video files", type=["mp4", "avi", "mov"], accept_multiple_files=True)
+uploaded_videos = st.file_uploader(
+    "Upload video files", type=["mp4", "avi", "mov"], accept_multiple_files=True
+)
 
 if uploaded_videos:
     st.info("⏳ Processing uploaded videos...")
@@ -88,6 +93,7 @@ if uploaded_videos:
     all_embeddings = []
 
     for video in uploaded_videos:
+        # Save to a temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(video.name)[1]) as tmp:
             tmp.write(video.read())
             tmp_path = tmp.name
@@ -123,6 +129,7 @@ if uploaded_videos:
 st.markdown("---")
 st.header("🔎 Search in processed videos")
 
+# ============ Search UI ============
 if os.path.exists("video_index.faiss") and os.path.exists("metadata.txt") and os.path.exists("objects.json"):
     query = st.text_input("Enter a text description to search:")
     if query:
@@ -135,19 +142,21 @@ if os.path.exists("video_index.faiss") and os.path.exists("metadata.txt") and os
             tfeat = clip_model.encode_text(tok.to(device))
             tfeat /= tfeat.norm(dim=-1, keepdim=True)
 
-        D, I = index.search(tfeat.cpu().numpy(), k=5)
+        D, I = index.search(tfeat.cpu().numpy(), k=6)
 
         st.subheader(f"Top matches for **'{query}'**:")
-        for idx, score in zip(I[0], D[0]):
+        cols = st.columns(3)  # 3 images per row
+        for idx_pos, (idx, score) in enumerate(zip(I[0], D[0])):
             fname = metadata[idx]
             img_path = os.path.join(FRAMES_FOLDER, fname)
             if os.path.exists(img_path):
-                st.image(img_path, caption=f"{fname} (score {score:.3f})", use_column_width=True)
+                with cols[idx_pos % 3]:
+                    st.image(img_path, caption=f"{fname}\n(score {score:.3f})", width=250)
+                    if fname in objects_map:
+                        for obj in objects_map[fname]:
+                            st.write(f"- **{obj['label']}** ({obj['conf']:.2f})")
             else:
-                st.write(f"❌ Image file not found: {img_path}")
-            st.write("Objects detected in this frame:")
-            for obj in objects_map.get(fname, []):
-                st.write(f"- **{obj['label']}** ({obj['conf']:.2f})")
+                st.write(f"❌ Image not found: {img_path}")
 
     # ============ Summarize Video ============
     st.markdown("---")

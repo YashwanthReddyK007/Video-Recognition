@@ -1,7 +1,6 @@
 import streamlit as st
 import tempfile
 import os
-import cv2
 import json
 import faiss
 import torch
@@ -10,6 +9,7 @@ from PIL import Image
 from ultralytics import YOLO
 import open_clip
 from collections import Counter
+import imageio.v3 as iio  # ✅ use imageio for frame extraction
 
 # =======================
 # SETTINGS
@@ -17,18 +17,16 @@ from collections import Counter
 FRAMES_FOLDER = "frames"
 os.makedirs(FRAMES_FOLDER, exist_ok=True)
 device = "cuda" if torch.cuda.is_available() else "cpu"
-st.set_page_config(page_title="Video Search (YOLO + CLIP)", layout="wide")
+st.set_page_config(page_title="Video Search", layout="wide")
 st.title("🎥🔎 Video Search with YOLOv8 + CLIP")
 
 # =======================
 # LOAD MODELS
 # =======================
-# Do not cache YOLO (pickle issues on Streamlit Cloud)
 if "yolo_model" not in st.session_state:
     st.session_state.yolo_model = YOLO("yolov8n.pt")
 yolo_model = st.session_state.yolo_model
 
-# Cache CLIP
 @st.cache_resource
 def load_clip():
     m, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
@@ -38,37 +36,28 @@ def load_clip():
 clip_model, clip_preprocess, tokenizer = load_clip()
 
 # =======================
-# HELPERS
+# FRAME EXTRACTION (with imageio)
 # =======================
 def extract_frames(video_path, every_n=30):
-    cap = cv2.VideoCapture(video_path)
-    count = 0
     saved = []
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if count % every_n == 0:
-            if frame is None or frame.size == 0:
-                print(f"[WARN] Empty frame at {count}")
-                continue
-            h, w, _ = frame.shape
-            # Optional resize for efficiency
-            if w > 640:
-                scale = 640 / w
-                frame = cv2.resize(frame, (640, int(h * scale)))
-
-            # Convert BGR -> RGB
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            img_pil = Image.fromarray(frame_rgb)
-
-            fname = f"{os.path.basename(video_path)}_{count}.jpg"
-            fpath = os.path.join(FRAMES_FOLDER, fname)
-            img_pil.save(fpath, format="JPEG")
-            saved.append(fname)
-        count += 1
-    cap.release()
-    return saved
+    try:
+        # iterate over frames using imageio
+        reader = iio.imiter(video_path)
+        for idx, frame in enumerate(reader):
+            if idx % every_n == 0:
+                img = Image.fromarray(frame)  # frame is already RGB
+                # Optionally resize for speed
+                if img.width > 640:
+                    scale = 640 / img.width
+                    img = img.resize((640, int(img.height * scale)))
+                fname = f"{os.path.basename(video_path)}_{idx}.jpg"
+                fpath = os.path.join(FRAMES_FOLDER, fname)
+                img.save(fpath, format="JPEG")
+                saved.append(fname)
+        return saved
+    except Exception as e:
+        st.error(f"❌ Frame extraction failed: {e}")
+        return []
 
 def detect_objects(img_path):
     results = yolo_model(img_path, conf=0.3, verbose=False)
@@ -105,7 +94,7 @@ if uploaded_videos:
             tmp_path = tmp.name
 
         st.write(f"📥 Extracting frames from **{video.name}**...")
-        frames = extract_frames(tmp_path, every_n=30)
+        frames = extract_frames(tmp_path, every_n=10)  # grab every 10th frame for more data
         all_frames.extend(frames)
 
         for frame in frames:

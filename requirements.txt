@@ -2,6 +2,6 @@ streamlit==1.37.1
 ultralytics==8.3.10
 torch==2.7.1
 open_clip_torch==2.24.0
-faiss-cpu==1.7.4
 opencv-python-headless==4.10.0.84
 Pillow==10.4.0
+scikit-learn==1.5.1

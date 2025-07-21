@@ -1,178 +1,92 @@
 import streamlit as st
-import tempfile
-import os
-import cv2
-import json
-import faiss
-import torch
-import numpy as np
 from PIL import Image
+import torch
 from ultralytics import YOLO
-import open_clip
-from collections import Counter
+import numpy as np
+import os
 
-# =======================
-# SETTINGS
-# =======================
-FRAMES_FOLDER = os.path.join(tempfile.gettempdir(), "frames")
-os.makedirs(FRAMES_FOLDER, exist_ok=True)
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# -----------------------
+# Title & Description
+# -----------------------
+st.set_page_config(page_title="Video/Image Recognition", layout="wide")
+st.title("🎥 Video & 🖼️ Image Recognition App")
+st.markdown("Upload an image or video, run detection with YOLOv8, and view the results!")
 
-# =======================
-# Load models (cached)
-# =======================
+# -----------------------
+# Load YOLO model
+# -----------------------
 @st.cache_resource
-def load_yolo():
-    # ✅ Load directly from official weights
-    return YOLO("yolov8n.pt")
+def load_model():
+    # Latest ultralytics with pytorch 2.7.1
+    model = YOLO("yolov8n.pt")  # or yolov8s.pt depending on accuracy/speed tradeoff
+    return model
 
-yolo_model = load_yolo()
+model = load_model()
+st.success(f"✅ YOLOv8 model loaded (PyTorch {torch.__version__})")
 
-@st.cache_resource
-def load_clip():
-    m, _, preprocess = open_clip.create_model_and_transforms(
-        "ViT-B-32", pretrained="openai"
-    )
-    return m.to(device).eval(), preprocess, open_clip.get_tokenizer("ViT-B-32")
+# -----------------------
+# File Upload
+# -----------------------
+uploaded_file = st.file_uploader("Upload an image or video", type=["jpg", "jpeg", "png", "mp4", "avi", "mov"])
 
-clip_model, clip_preprocess, tokenizer = load_clip()
+if uploaded_file is not None:
+    # Save to a temporary path
+    temp_dir = "temp_uploads"
+    os.makedirs(temp_dir, exist_ok=True)
+    file_path = os.path.join(temp_dir, uploaded_file.name)
 
-# =======================
-# Helper functions
-# =======================
-def extract_frames(video_path, every_n=30):
-    cap = cv2.VideoCapture(video_path)
-    count = 0
-    saved = []
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if count % every_n == 0:
-            fname = f"{os.path.basename(video_path)}_{count}.jpg"
-            fpath = os.path.join(FRAMES_FOLDER, fname)
-            cv2.imwrite(fpath, frame)
-            saved.append(fname)
-        count += 1
-    cap.release()
-    return saved
+    with open(file_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    st.info(f"📁 Saved file to {file_path}")
 
-def detect_objects(img_path):
-    results = yolo_model(img_path, conf=0.2, verbose=False)  # lowered conf
-    objs = []
-    for box in results[0].boxes:
-        objs.append({
-            "label": results[0].names[int(box.cls[0])],
-            "conf": float(box.conf[0])
-        })
-    return objs
+    # -----------------------
+    # Process Image
+    # -----------------------
+    if uploaded_file.type.startswith("image"):
+        # Display original
+        image = Image.open(uploaded_file)
+        st.image(image, caption="Uploaded Image", use_container_width=True)
 
-def encode_image(img_path):
-    img = Image.open(img_path).convert("RGB")
-    tens = clip_preprocess(img).unsqueeze(0).to(device)
-    with torch.no_grad():
-        feat = clip_model.encode_image(tens)
-        feat /= feat.norm(dim=-1, keepdim=True)
-    return feat.cpu().numpy()
+        # Run detection
+        st.write("🔍 Running detection… please wait")
+        results = model(image)
+        # Save the annotated result
+        result_img_path = os.path.join(temp_dir, "result.jpg")
+        annotated_img = results[0].plot()  # numpy array
+        Image.fromarray(annotated_img).save(result_img_path)
 
-# =======================
-# Streamlit UI
-# =======================
-st.set_page_config(page_title="Video Intelligence", layout="wide")
-st.title("🎥🔎 Video Intelligence with YOLO + CLIP")
+        st.image(annotated_img, caption="Detection Result", use_container_width=True)
 
-# ============ Video Upload & Processing ============
-uploaded_videos = st.file_uploader(
-    "Upload video files", type=["mp4", "avi", "mov"], accept_multiple_files=True
-)
+        # Summary of detections
+        names = model.names
+        detected_counts = {}
+        for box in results[0].boxes:
+            cls_id = int(box.cls)
+            cls_name = names.get(cls_id, str(cls_id))
+            detected_counts[cls_name] = detected_counts.get(cls_name, 0) + 1
 
-if uploaded_videos:
-    st.info("⏳ Processing uploaded videos...")
-    all_frames = []
-    all_objects = {}
-    all_embeddings = []
-
-    for video in uploaded_videos:
-        # Save to a temp file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(video.name)[1]) as tmp:
-            tmp.write(video.read())
-            tmp_path = tmp.name
-
-        st.write(f"📥 Extracting frames from **{video.name}**...")
-        frames = extract_frames(tmp_path, every_n=30)
-        all_frames.extend(frames)
-
-        for frame in frames:
-            fpath = os.path.join(FRAMES_FOLDER, frame)
-            objs = detect_objects(fpath)
-            all_objects[frame] = objs
-            emb = encode_image(fpath)
-            all_embeddings.append(emb)
-
-    # Save metadata
-    with open("metadata.txt", "w") as f:
-        for m in all_frames:
-            f.write(f"{m}\n")
-    with open("objects.json", "w") as f:
-        json.dump(all_objects, f, indent=2)
-
-    # Build FAISS index
-    if all_embeddings:
-        dim = all_embeddings[0].shape[1]
-        index = faiss.IndexFlatIP(dim)
-        index.add(np.vstack(all_embeddings))
-        faiss.write_index(index, "video_index.faiss")
-        st.success("✅ Processing complete! You can now search for objects or summarize the video.")
-    else:
-        st.error("⚠️ No frames processed!")
-
-st.markdown("---")
-st.header("🔎 Search in processed videos")
-
-# ============ Search UI ============
-if os.path.exists("video_index.faiss") and os.path.exists("metadata.txt") and os.path.exists("objects.json"):
-    query = st.text_input("Enter a text description to search:")
-    if query:
-        index = faiss.read_index("video_index.faiss")
-        metadata = [line.strip() for line in open("metadata.txt")]
-        objects_map = json.load(open("objects.json"))
-
-        tok = tokenizer([query])
-        with torch.no_grad():
-            tfeat = clip_model.encode_text(tok.to(device))
-            tfeat /= tfeat.norm(dim=-1, keepdim=True)
-
-        D, I = index.search(tfeat.cpu().numpy(), k=6)
-
-        st.subheader(f"Top matches for **'{query}'**:")
-        cols = st.columns(3)  # 3 images per row
-        for idx_pos, (idx, score) in enumerate(zip(I[0], D[0])):
-            fname = metadata[idx]
-            img_path = os.path.join(FRAMES_FOLDER, fname)
-            if os.path.exists(img_path):
-                with cols[idx_pos % 3]:
-                    st.image(img_path, caption=f"{fname}\n(score {score:.3f})", width=250)
-                    if fname in objects_map:
-                        for obj in objects_map[fname]:
-                            st.write(f"- **{obj['label']}** ({obj['conf']:.2f})")
-            else:
-                st.write(f"❌ Image not found: {img_path}")
-
-    # ============ Summarize Video ============
-    st.markdown("---")
-    st.header("📋 Summarize Video Content")
-    if st.button("Summarize All Objects"):
-        objects_map = json.load(open("objects.json"))
-        all_labels = [obj["label"] for objs in objects_map.values() for obj in objs]
-        if not all_labels:
-            st.warning("No objects detected yet.")
+        st.markdown("### 📋 Detection Summary")
+        if detected_counts:
+            for k, v in detected_counts.items():
+                st.write(f"✅ {k}: {v}")
         else:
-            counts = Counter(all_labels)
-            st.write("✅ **Summary of objects detected across all frames:**")
-            for label, count in counts.most_common():
-                st.write(f"- **{label}** appears in {count} frames")
-else:
-    st.warning("⚠️ Please upload and process videos first.")
+            st.write("⚠️ No objects detected.")
 
-st.markdown("---")
-st.caption("Built with ❤️ using Streamlit, YOLOv8, and CLIP")
+    # -----------------------
+    # Process Video
+    # -----------------------
+    elif uploaded_file.type.startswith("video"):
+        st.video(file_path)
+        st.write("🔍 Running detection on video… this may take a while.")
+
+        # Run YOLO prediction on video (stream=True allows frame-by-frame processing)
+        output_path = os.path.join(temp_dir, "result_video.mp4")
+        results = model.predict(file_path, save=True, project=temp_dir, name="video_results")
+        # YOLO saves processed video in temp_dir/video_results
+        predicted_video = os.path.join(temp_dir, "video_results", uploaded_file.name)
+
+        if os.path.exists(predicted_video):
+            st.video(predicted_video)
+            st.success("✅ Detection completed on video!")
+        else:
+            st.error("❌ Processed video not found. Check logs for errors.")

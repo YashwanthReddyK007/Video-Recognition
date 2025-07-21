@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image
 from ultralytics import YOLO
 import open_clip
-from tqdm import tqdm
+from collections import Counter
 
 # =======================
 # SETTINGS
@@ -18,7 +18,9 @@ FRAMES_FOLDER = "frames"
 os.makedirs(FRAMES_FOLDER, exist_ok=True)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Load models
+# =======================
+# Load models (cached)
+# =======================
 @st.cache_resource
 def load_yolo():
     return YOLO("yolov8n.pt")
@@ -46,7 +48,7 @@ def extract_frames(video_path, every_n=30):
             fname = f"{os.path.basename(video_path)}_{count}.jpg"
             fpath = os.path.join(FRAMES_FOLDER, fname)
             cv2.imwrite(fpath, frame)
-            saved.append(fname)
+            saved.append(fname)  # store only filename
         count += 1
     cap.release()
     return saved
@@ -75,25 +77,26 @@ def encode_image(img_path):
 st.set_page_config(page_title="Video Intelligence", layout="wide")
 st.title("🎥🔎 Video Intelligence with YOLO + CLIP")
 
+# ============ Video Upload & Processing ============
 uploaded_videos = st.file_uploader("Upload video files", type=["mp4", "avi", "mov"], accept_multiple_files=True)
 
 if uploaded_videos:
-    st.info("Processing uploaded videos...")
+    st.info("⏳ Processing uploaded videos...")
     all_frames = []
     all_objects = {}
     all_embeddings = []
 
     for video in uploaded_videos:
         # Save to temp file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=video.name) as tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(video.name)[1]) as tmp:
             tmp.write(video.read())
             tmp_path = tmp.name
 
-        st.write(f"📥 Extracting frames from {video.name}...")
+        st.write(f"📥 Extracting frames from **{video.name}**...")
         frames = extract_frames(tmp_path, every_n=30)
         all_frames.extend(frames)
 
-        for frame in tqdm(frames):
+        for frame in frames:
             fpath = os.path.join(FRAMES_FOLDER, frame)
             objs = detect_objects(fpath)
             all_objects[frame] = objs
@@ -113,9 +116,9 @@ if uploaded_videos:
         index = faiss.IndexFlatIP(dim)
         index.add(np.vstack(all_embeddings))
         faiss.write_index(index, "video_index.faiss")
-        st.success("✅ Processing complete! You can now search for objects.")
+        st.success("✅ Processing complete! You can now search for objects or summarize the video.")
     else:
-        st.error("No frames processed!")
+        st.error("⚠️ No frames processed!")
 
 st.markdown("---")
 st.header("🔎 Search in processed videos")
@@ -134,13 +137,32 @@ if os.path.exists("video_index.faiss") and os.path.exists("metadata.txt") and os
 
         D, I = index.search(tfeat.cpu().numpy(), k=5)
 
-        st.subheader(f"Top matches for '{query}':")
+        st.subheader(f"Top matches for **'{query}'**:")
         for idx, score in zip(I[0], D[0]):
             fname = metadata[idx]
-            st.image(os.path.join(FRAMES_FOLDER, fname), caption=f"{fname} (score {score:.3f})")
+            img_path = os.path.join(FRAMES_FOLDER, fname)
+            if os.path.exists(img_path):
+                st.image(img_path, caption=f"{fname} (score {score:.3f})", use_column_width=True)
+            else:
+                st.write(f"❌ Image file not found: {img_path}")
             st.write("Objects detected in this frame:")
             for obj in objects_map.get(fname, []):
                 st.write(f"- **{obj['label']}** ({obj['conf']:.2f})")
+
+    # ============ NEW FEATURE: Summarize Video Content ============
+    st.markdown("---")
+    st.header("📋 Summarize Video Content")
+    if st.button("Summarize All Objects"):
+        objects_map = json.load(open("objects.json"))
+        all_labels = [obj["label"] for objs in objects_map.values() for obj in objs]
+        if not all_labels:
+            st.warning("No objects detected yet.")
+        else:
+            counts = Counter(all_labels)
+            st.write("✅ **Summary of objects detected across all frames:**")
+            for label, count in counts.most_common():
+                st.write(f"- **{label}** appears in {count} frames")
+
 else:
     st.warning("⚠️ Please upload and process videos first.")
 

@@ -1,8 +1,8 @@
-streamlit
+opencv-python-headless
 ultralytics
 open_clip_torch
 faiss-cpu
 pillow
-opencv-python
 tqdm
+streamlit
 torch

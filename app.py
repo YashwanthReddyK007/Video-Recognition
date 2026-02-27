@@ -1,4 +1,4 @@
-# ========================= # SINGLE-CELL TRAFFIC VIDEO AI APP (with Accident Detection) # =========================
+# ========================= TRAFFIC VIDEO AI APP =========================
 import streamlit as st
 import os, cv2, tempfile, shutil, uuid, datetime
 import torch
@@ -6,50 +6,56 @@ import numpy as np
 from ultralytics import YOLO
 from collections import Counter
 
-# -------------------------
+# -----------------------------------------------------------------------
 # CONFIG
-# -------------------------
+# -----------------------------------------------------------------------
 st.set_page_config(page_title="🚦 Traffic Analysis Video AI", layout="wide")
 st.title("🚦 Traffic Analysis (Video AI)")
 
 DEVICE         = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_FRAMES     = 200
 TARGET_FPS     = 2
-CONF_THRES     = 0.25    # slightly lower to catch more in accident scenes
+CONF_THRES     = 0.30
 MAX_VIOLATIONS = 20
-
 VEHICLE_CLASSES = {"car", "truck", "bus", "motorcycle"}
 
-# Accident heuristic thresholds
-OVERLAP_IOU_THRESH   = 0.10   # IoU between two vehicles = collision proxy
-CLUSTER_DIST_THRESH  = 80     # px — vehicles closer than this = pile-up proxy
-SUDDEN_STOP_THRESH   = 0.60   # vehicle count drops this fraction vs rolling avg
-MOTION_SPIKE_THRESH  = 40.0   # optical-flow magnitude = chaotic motion proxy
+# ── Accident heuristic thresholds ──────────────────────────────────────
+# WHY these values:
+#   Normal traffic perspective causes apparent IoU of 0.05–0.25 between
+#   cars in adjacent lanes. Real physical collisions merge boxes deeply.
+OVERLAP_IOU_THRESH     = 0.40  # deep bbox merge only (not perspective illusion)
+OVERLAP_PERSIST_FRAMES = 2     # overlap must hold N consecutive sampled frames
+CLUSTER_DIST_THRESH    = 40    # very tight centroid distance (px) to avoid traffic-jam FP
+CLUSTER_MIN_VEHICLES   = 3     # need 3+ vehicles in cluster
+SUDDEN_STOP_THRESH     = 0.70  # vehicle count must drop 70%+ vs rolling avg
+MOTION_SPIKE_THRESH    = 60.0  # normal traffic ~20–35px/frame; accidents spike above 60
+MIN_SIGNALS            = 2     # require this many independent signals per incident
+DEDUP_FRAME_GAP        = 4     # ignore new accident within N frames of last one
 
-# -------------------------
+# -----------------------------------------------------------------------
 # MODEL
-# -------------------------
+# -----------------------------------------------------------------------
 @st.cache_resource
 def load_yolo():
-    model = YOLO("yolov8n.pt")
-    model.to(DEVICE)
-    return model
+    m = YOLO("yolov8n.pt")
+    m.to(DEVICE)
+    return m
 
 yolo = load_yolo()
 
-# -------------------------
+# -----------------------------------------------------------------------
 # SESSION DIR
-# -------------------------
-def make_session_dir() -> str:
+# -----------------------------------------------------------------------
+def make_session_dir():
     sid  = st.session_state.setdefault("session_id", str(uuid.uuid4())[:8])
     path = os.path.join(tempfile.gettempdir(), f"traffic_{sid}")
     os.makedirs(path, exist_ok=True)
     return path
 
-# -------------------------
+# -----------------------------------------------------------------------
 # FRAME EXTRACTION
-# -------------------------
-def extract_frames(video_path: str, frames_dir: str):
+# -----------------------------------------------------------------------
+def extract_frames(video_path, frames_dir):
     cap = cv2.VideoCapture(video_path)
     raw_fps = cap.get(cv2.CAP_PROP_FPS)
     if not raw_fps or raw_fps <= 0:
@@ -70,10 +76,10 @@ def extract_frames(video_path: str, frames_dir: str):
     cap.release()
     return frames, raw_fps
 
-# -------------------------
+# -----------------------------------------------------------------------
 # DETECTION
-# -------------------------
-def detect_objects(img_path: str):
+# -----------------------------------------------------------------------
+def detect_objects(img_path):
     res  = yolo(img_path, conf=CONF_THRES, verbose=False)[0]
     dets = []
     for b in res.boxes:
@@ -87,39 +93,50 @@ def detect_objects(img_path: str):
         })
     return dets
 
-# -------------------------
+# -----------------------------------------------------------------------
 # GEOMETRY
-# -------------------------
+# -----------------------------------------------------------------------
 def iou(a, b):
     ix1 = max(a["x1"], b["x1"]); iy1 = max(a["y1"], b["y1"])
     ix2 = min(a["x2"], b["x2"]); iy2 = min(a["y2"], b["y2"])
     inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
     if inter == 0:
         return 0.0
-    area_a = (a["x2"] - a["x1"]) * (a["y2"] - a["y1"])
-    area_b = (b["x2"] - b["x1"]) * (b["y2"] - b["y1"])
-    return inter / (area_a + area_b - inter)
+    aa = (a["x2"] - a["x1"]) * (a["y2"] - a["y1"])
+    ab = (b["x2"] - b["x1"]) * (b["y2"] - b["y1"])
+    return inter / (aa + ab - inter)
 
 def cdist(a, b):
     return ((a["cx"] - b["cx"])**2 + (a["cy"] - b["cy"])**2) ** 0.5
 
-# -------------------------
+# -----------------------------------------------------------------------
 # ACCIDENT HEURISTICS
-# -------------------------
+# -----------------------------------------------------------------------
 def check_overlap(dets):
+    """
+    Only fires when IoU >= 0.40 — eliminates the perspective-overlap false
+    positives that normal adjacent-lane traffic causes (typical IoU 0.05–0.25).
+    """
     veh = [d for d in dets if d["label"] in VEHICLE_CLASSES]
     for i in range(len(veh)):
         for j in range(i + 1, len(veh)):
             v = iou(veh[i], veh[j])
             if v >= OVERLAP_IOU_THRESH:
-                return True, f"{veh[i]['label']} ↔ {veh[j]['label']} overlap (IoU {v:.2f})"
+                return True, f"{veh[i]['label']} ↔ {veh[j]['label']} deep overlap (IoU {v:.2f})"
     return False, ""
 
 def check_cluster(dets):
+    """
+    Requires CLUSTER_MIN_VEHICLES vehicles within CLUSTER_DIST_THRESH px.
+    Tighter than before to avoid flagging normal gridlock at traffic lights.
+    """
     veh = [d for d in dets if d["label"] in VEHICLE_CLASSES]
+    if len(veh) < CLUSTER_MIN_VEHICLES:
+        return False, ""
     for i in range(len(veh)):
-        close = [veh[j] for j in range(len(veh)) if i != j and cdist(veh[i], veh[j]) < CLUSTER_DIST_THRESH]
-        if len(close) >= 2:
+        close = [veh[j] for j in range(len(veh))
+                 if i != j and cdist(veh[i], veh[j]) < CLUSTER_DIST_THRESH]
+        if len(close) >= CLUSTER_MIN_VEHICLES - 1:
             return True, f"{len(close)+1} vehicles within {CLUSTER_DIST_THRESH}px"
     return False, ""
 
@@ -132,25 +149,30 @@ def check_motion(prev_gray, curr_gray):
     if prev_gray is None or curr_gray is None:
         return False, "", 0.0
     try:
-        flow = cv2.calcOpticalFlowFarneback(prev_gray, curr_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-        mag  = float(np.mean(np.sqrt(flow[..., 0]**2 + flow[..., 1]**2)))
+        flow = cv2.calcOpticalFlowFarneback(
+            prev_gray, curr_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        mag = float(np.mean(np.sqrt(flow[..., 0]**2 + flow[..., 1]**2)))
         if mag > MOTION_SPIKE_THRESH:
             return True, f"Motion spike {mag:.1f}px/frame", mag
         return False, "", mag
     except Exception:
         return False, "", 0.0
 
-# -------------------------
+# -----------------------------------------------------------------------
 # ANNOTATE FRAME
-# -------------------------
+# -----------------------------------------------------------------------
 def annotate_frame(frame_path, reasons, dets):
     img = cv2.imread(frame_path)
     if img is None:
         return np.zeros((480, 640, 3), dtype=np.uint8)
     for d in dets:
         if d["label"] in VEHICLE_CLASSES:
-            cv2.rectangle(img, (int(d["x1"]), int(d["y1"])), (int(d["x2"]), int(d["y2"])), (0, 0, 255), 2)
-            cv2.putText(img, d["label"], (int(d["x1"]), int(d["y1"]) - 6),
+            cv2.rectangle(img,
+                          (int(d["x1"]), int(d["y1"])),
+                          (int(d["x2"]), int(d["y2"])),
+                          (0, 0, 255), 2)
+            cv2.putText(img, d["label"],
+                        (int(d["x1"]), max(0, int(d["y1"]) - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
     cv2.rectangle(img, (0, 0), (img.shape[1], 36), (0, 0, 180), -1)
     cv2.putText(img, "*** ACCIDENT DETECTED ***", (8, 26),
@@ -160,46 +182,56 @@ def annotate_frame(frame_path, reasons, dets):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 80, 255), 1)
     return img
 
-# -------------------------
+# -----------------------------------------------------------------------
 # REPORT
-# -------------------------
-def build_report(video_name, total_frames, fps, congestion_data, label_counter, accidents, violations):
+# -----------------------------------------------------------------------
+def build_report(video_name, total_frames, fps, congestion_data,
+                 label_counter, accidents, violations):
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    L   = []
-    L  += ["=" * 60, "       TRAFFIC INCIDENT ANALYSIS REPORT", "=" * 60]
-    L  += [f"Generated  : {now}", f"Video File : {video_name}",
-           f"Source FPS : {fps:.1f}  |  Frames Analysed : {total_frames}", ""]
-    L  += ["── SUMMARY ─────────────────────────────────────────────",
-           f"  Average Congestion  : {np.mean(congestion_data):.2f} vehicles/frame",
-           f"  Peak Congestion     : {int(np.max(congestion_data))} vehicles/frame",
-           f"  Accidents Detected  : {len(accidents)}",
-           f"  Other Violations    : {len(violations)}", ""]
-    L  += ["── OBJECT COUNTS ────────────────────────────────────────"]
+    L = [
+        "=" * 60,
+        "       TRAFFIC INCIDENT ANALYSIS REPORT",
+        "=" * 60,
+        f"Generated  : {now}",
+        f"Video File : {video_name}",
+        f"Source FPS : {fps:.1f}  |  Frames Analysed : {total_frames}",
+        "",
+        "── SUMMARY ─────────────────────────────────────────────",
+        f"  Average Congestion  : {np.mean(congestion_data):.2f} vehicles/frame",
+        f"  Peak Congestion     : {int(np.max(congestion_data))} vehicles/frame",
+        f"  Accidents Detected  : {len(accidents)}",
+        f"  Other Violations    : {len(violations)}",
+        "",
+        "── OBJECT COUNTS ────────────────────────────────────────",
+    ]
     for label, count in label_counter.most_common():
         L.append(f"  {label:<22}: {count}")
-    L  += ["", "── ACCIDENT EVENTS ──────────────────────────────────────"]
+    L += ["", "── ACCIDENT EVENTS ──────────────────────────────────────"]
     if accidents:
         for i, acc in enumerate(accidents, 1):
-            L += ["", f"  Incident #{i}",
-                  f"  Frame Index : {acc['frame_idx']}",
-                  f"  Frame File  : {os.path.basename(acc['frame_path'])}",
-                  f"  Triggers    :"]
+            L += [
+                "",
+                f"  Incident #{i}",
+                f"  Frame Index : {acc['frame_idx']}",
+                f"  Frame File  : {os.path.basename(acc['frame_path'])}",
+                f"  Triggers    :",
+            ]
             for r in acc["reasons"]:
                 L.append(f"    • {r}")
     else:
         L.append("  None detected.")
-    L  += ["", "── OTHER VIOLATIONS ─────────────────────────────────────"]
+    L += ["", "── OTHER VIOLATIONS ─────────────────────────────────────"]
     if violations:
         for fp, vtype in violations:
             L.append(f"  {vtype:<30} | {os.path.basename(fp)}")
     else:
         L.append("  None detected.")
-    L  += ["", "=" * 60, "END OF REPORT", "=" * 60]
+    L += ["", "=" * 60, "END OF REPORT", "=" * 60]
     return "\n".join(L)
 
-# -------------------------
+# -----------------------------------------------------------------------
 # HELPERS
-# -------------------------
+# -----------------------------------------------------------------------
 def congestion_score(dets):
     return sum(1 for d in dets if d["label"] in VEHICLE_CLASSES)
 
@@ -208,11 +240,15 @@ def triple_riding(dets):
     bikes   = sum(1 for d in dets if d["label"] == "motorcycle")
     return bikes == 1 and persons >= 3
 
-# ========================= MAIN UI =========================
-video_file = st.file_uploader("Upload traffic video (≤60 s recommended)", type=["mp4", "avi", "mov"])
+# ======================================================================
+# MAIN UI
+# ======================================================================
+video_file = st.file_uploader(
+    "Upload traffic video (≤60 s recommended)", type=["mp4", "avi", "mov"]
+)
 
 if video_file:
-    frames_dir   = make_session_dir()
+    frames_dir    = make_session_dir()
     annotated_dir = os.path.join(frames_dir, "annotated")
     os.makedirs(annotated_dir, exist_ok=True)
 
@@ -231,15 +267,16 @@ if video_file:
 
     st.success(f"Extracted **{len(frames)}** frames  |  Source FPS: {detected_fps:.1f}")
 
-    # ── PROCESSING ────────────────────────────────────────────
-    congestion_data : list  = []
-    violations      : list  = []
-    accidents       : list  = []
-    label_counter           = Counter()
-    flow_data       : list  = []
-    errors          : list  = []
-    prev_gray               = None
-    count_window    : list  = []
+    # ── PROCESSING ────────────────────────────────────────────────────
+    congestion_data = []
+    violations      = []
+    accidents       = []
+    label_counter   = Counter()
+    flow_data       = []
+    errors          = []
+    prev_gray       = None
+    count_window    = []
+    overlap_streak  = 0   # tracks consecutive frames with deep vehicle overlap
 
     st.subheader("🔍 Processing Frames")
     prog = st.progress(0)
@@ -249,8 +286,11 @@ if video_file:
             dets = detect_objects(frame_path)
         except Exception as e:
             errors.append(f"Frame {i}: {e}")
-            congestion_data.append(0); flow_data.append(0.0)
-            prog.progress((i + 1) / len(frames)); continue
+            congestion_data.append(0)
+            flow_data.append(0.0)
+            overlap_streak = 0
+            prog.progress((i + 1) / len(frames))
+            continue
 
         for d in dets:
             label_counter[d["label"]] += 1
@@ -263,28 +303,59 @@ if video_file:
         rolling_avg = float(np.mean(count_window))
 
         # optical flow
-        bgr      = cv2.imread(frame_path)
+        bgr       = cv2.imread(frame_path)
         curr_gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr is not None else None
         motion_flag, motion_reason, flow_mag = check_motion(prev_gray, curr_gray)
         flow_data.append(flow_mag)
         prev_gray = curr_gray
 
-        # accident signals
+        # ── ACCIDENT SIGNALS ──────────────────────────────────────────
         reasons = []
-        f, r = check_overlap(dets);             (reasons.append(f"Vehicle overlap — {r}") if f else None)
-        f, r = check_cluster(dets);             (reasons.append(f"Vehicle cluster — {r}") if f else None)
-        f, r = check_sudden_stop(v_count, rolling_avg); (reasons.append(f"Sudden stop — {r}") if f else None)
-        if motion_flag: reasons.append(f"Motion spike — {motion_reason}")
 
-        # require ≥2 signals to reduce false positives
-        if len(reasons) >= 2 and len(accidents) < MAX_VIOLATIONS:
+        # Signal 1: Deep overlap — must persist across consecutive frames
+        # (single-frame overlap is almost always a perspective artefact)
+        overlap_now, overlap_reason = check_overlap(dets)
+        if overlap_now:
+            overlap_streak += 1
+        else:
+            overlap_streak = 0
+        if overlap_streak >= OVERLAP_PERSIST_FRAMES:
+            reasons.append(
+                f"Sustained vehicle overlap — {overlap_reason} "
+                f"({overlap_streak} consecutive frames)"
+            )
+
+        # Signal 2: Tight vehicle cluster
+        f, r = check_cluster(dets)
+        if f:
+            reasons.append(f"Vehicle cluster — {r}")
+
+        # Signal 3: Sharp vehicle count drop
+        f, r = check_sudden_stop(v_count, rolling_avg)
+        if f:
+            reasons.append(f"Sudden stop — {r}")
+
+        # Signal 4: Chaotic optical flow spike
+        if motion_flag:
+            reasons.append(f"Motion spike — {motion_reason}")
+
+        # Fire only when ≥ MIN_SIGNALS triggered AND not a duplicate of last event
+        last_acc_frame = accidents[-1]["frame_idx"] if accidents else -99
+        is_new_event   = (i - last_acc_frame) > DEDUP_FRAME_GAP
+        if len(reasons) >= MIN_SIGNALS and is_new_event and len(accidents) < MAX_VIOLATIONS:
             ann_img  = annotate_frame(frame_path, reasons, dets)
-            ann_path = os.path.join(annotated_dir, f"accident_{len(accidents):03d}_f{i:04d}.jpg")
+            ann_path = os.path.join(
+                annotated_dir, f"accident_{len(accidents):03d}_f{i:04d}.jpg"
+            )
             cv2.imwrite(ann_path, ann_img)
-            accidents.append({"frame_idx": i, "frame_path": frame_path,
-                               "ann_path": ann_path, "reasons": reasons})
+            accidents.append({
+                "frame_idx":  i,
+                "frame_path": frame_path,
+                "ann_path":   ann_path,
+                "reasons":    reasons,
+            })
 
-        # other violations
+        # Other violations
         if triple_riding(dets) and len(violations) < MAX_VIOLATIONS:
             violations.append((frame_path, "Triple Riding"))
 
@@ -294,13 +365,13 @@ if video_file:
         with st.expander(f"⚠️ {len(errors)} frame(s) failed"):
             st.write("\n".join(errors[:20]))
 
-    # ── REPORT ────────────────────────────────────────────────
+    # ── REPORT ────────────────────────────────────────────────────────
     report_text = build_report(
         video_file.name, len(frames), detected_fps,
         congestion_data, label_counter, accidents, violations
     )
 
-    # ── DASHBOARD ─────────────────────────────────────────────
+    # ── DASHBOARD ─────────────────────────────────────────────────────
     st.markdown("---")
     st.header("📊 Summary")
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -310,22 +381,25 @@ if video_file:
     c4.metric("Accidents Detected", len(accidents))
     c5.metric("Other Violations",   len(violations))
 
-    # ── ACCIDENT SECTION ──────────────────────────────────────
+    # ── ACCIDENT SECTION ──────────────────────────────────────────────
     st.markdown("---")
     st.subheader("🚨 Accident Detection Results")
     if accidents:
         st.error(f"**{len(accidents)} accident event(s) detected.**")
         for k, acc in enumerate(accidents):
-            with st.expander(f"Incident #{k+1}  —  Frame {acc['frame_idx']}", expanded=(k == 0)):
-                st.image(acc["ann_path"], caption=f"Annotated Frame {acc['frame_idx']}",
+            with st.expander(
+                f"Incident #{k+1}  —  Frame {acc['frame_idx']}", expanded=(k == 0)
+            ):
+                st.image(acc["ann_path"],
+                         caption=f"Annotated Frame {acc['frame_idx']}",
                          use_container_width=True)
                 st.markdown("**Triggered signals:**")
                 for r in acc["reasons"]:
                     st.markdown(f"- {r}")
-                with open(acc["ann_path"], "rb") as f:
+                with open(acc["ann_path"], "rb") as fh:
                     st.download_button(
                         label     = f"⬇️ Download Annotated Frame #{k+1}",
-                        data      = f.read(),
+                        data      = fh.read(),
                         file_name = os.path.basename(acc["ann_path"]),
                         mime      = "image/jpeg",
                         key       = f"dl_frame_{k}",
@@ -333,7 +407,7 @@ if video_file:
     else:
         st.success("No accident events detected.")
 
-    # ── REPORT DOWNLOAD ───────────────────────────────────────
+    # ── REPORT DOWNLOAD ───────────────────────────────────────────────
     st.markdown("---")
     st.subheader("📄 Full Incident Report")
     st.text(report_text)
@@ -344,11 +418,13 @@ if video_file:
         mime      = "text/plain",
     )
 
-    # ── OBJECT COUNTS ─────────────────────────────────────────
+    # ── OBJECT COUNTS ─────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("🚗 Object Frequency")
-    traffic_labels = {k: v for k, v in label_counter.items() if k in VEHICLE_CLASSES | {"person"}}
-    other_labels   = {k: v for k, v in label_counter.items() if k not in traffic_labels}
+    traffic_labels = {k: v for k, v in label_counter.items()
+                      if k in VEHICLE_CLASSES | {"person"}}
+    other_labels   = {k: v for k, v in label_counter.items()
+                      if k not in traffic_labels}
     for k, v in sorted(traffic_labels.items(), key=lambda x: -x[1]):
         st.write(f"- **{k}** : {v}")
     if other_labels:
@@ -356,7 +432,7 @@ if video_file:
             for k, v in sorted(other_labels.items(), key=lambda x: -x[1]):
                 st.write(f"- {k} : {v}")
 
-    # ── OTHER VIOLATIONS ──────────────────────────────────────
+    # ── OTHER VIOLATIONS ──────────────────────────────────────────────
     st.subheader("🚦 Other Violations")
     if violations:
         cols = st.columns(min(3, len(violations[:6])))
@@ -365,13 +441,13 @@ if video_file:
     else:
         st.success("No other violations detected.")
 
-    # ── CHARTS ────────────────────────────────────────────────
+    # ── CHARTS ────────────────────────────────────────────────────────
     st.subheader("📈 Congestion Over Time")
     st.line_chart(congestion_data)
     st.subheader("🌊 Motion Intensity (Optical Flow)")
     st.line_chart(flow_data)
 
-    # ── CLEANUP ───────────────────────────────────────────────
+    # ── CLEANUP ───────────────────────────────────────────────────────
     try:
         shutil.rmtree(frames_dir)
         del st.session_state["session_id"]
@@ -380,4 +456,7 @@ if video_file:
 
 else:
     st.info("Upload a traffic video to begin analysis.")
-    st.caption(f"Running on: **{DEVICE.upper()}**  |  Max frames: {MAX_FRAMES}  |  Sampling: {TARGET_FPS} fps")
+    st.caption(
+        f"Running on: **{DEVICE.upper()}**  |  "
+        f"Max frames: {MAX_FRAMES}  |  Sampling: {TARGET_FPS} fps"
+    )
